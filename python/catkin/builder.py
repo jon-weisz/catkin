@@ -36,6 +36,7 @@ import copy
 import io
 import multiprocessing
 import os
+import stat
 import subprocess
 import sys
 
@@ -187,6 +188,22 @@ def isolation_print_command(cmd, path=None):
         )
 
 
+def get_python_path(path):
+    python_path = []
+    lib_path = os.path.join(path, 'lib')
+    if os.path.exists(lib_path):
+        items = os.listdir(lib_path)
+        for item in items:
+            if os.path.isdir(item) and item.startswith('python'):
+                python_items = os.listdir(os.path.join(lib_path, item))
+                for py_item in python_items:
+                    if py_item in ['dist-packages', 'site-packages']:
+                        py_path = os.path.join(lib_path, item, py_item)
+                        if os.path.isdir(py_path):
+                            python_path.append(py_path)
+    return python_path
+
+
 def build_catkin_package(
     path, package,
     workspace, buildspace, develspace, installspace,
@@ -270,16 +287,14 @@ def build_cmake_package(
 
     # Check for Makefile and maybe call cmake
     makefile = os.path.join(build_dir, 'Makefile')
+    install_target = installspace if install else develspace
     if not os.path.exists(makefile) or force_cmake:
         # Call cmake
         cmake_cmd = [
             'cmake',
-            os.path.dirname(package.filename)
+            os.path.dirname(package.filename),
+            '-DCMAKE_INSTALL_PREFIX=' + install_target + ''
         ]
-        if install:
-            cmake_cmd.append('-DCMAKE_INSTALL_PREFIX=' + installspace + '')
-        else:
-            cmake_cmd.append('-DCMAKE_INSTALL_PREFIX=' + develspace + '')
         isolation_print_command(' '.join(cmake_cmd))
         if last_env is not None:
             cmake_cmd = [last_env] + cmake_cmd
@@ -308,6 +323,48 @@ def build_cmake_package(
     if last_env is not None:
         make_install_cmd = [last_env] + make_install_cmd
     run_command(make_install_cmd, build_dir, quiet)
+
+    # If we are installing, and a env_cached.sh exists, don't overwrite it
+    if install and os.path.exists(os.path.join(installspace, 'env_cached.sh')):
+        return
+    cprint(blue_arrow + " Generating an env_cached.sh")
+    # Generate basic env.sh for chaining to catkin packages
+    new_env_path = os.path.join(build_dir, 'env_cached.sh')
+    cmake_prefix_path = install_target + ":"
+    ld_path = os.path.join(install_target, 'lib') + ":"
+    pythonpath = ":".join(get_python_path(install_target))
+    if pythonpath:
+        pythonpath += ":"
+    pkgcfg_path = os.path.join(install_target, 'lib', 'pkgconfig') + ":"
+    path = os.path.join(install_target, 'bin') + ":"
+    with open(new_env_path, 'w+') as file_handle:
+        file_handle.write("""\
+#!/bin/sh
+. {0}
+
+# detect if running on Darwin platform
+UNAME=`which uname`
+UNAME=`$UNAME`
+IS_DARWIN=0
+if [ "$UNAME" = "Darwin" ]; then
+  IS_DARWIN=1
+fi
+
+# Prepend to environment
+export CMAKE_PREFIX_PATH="{1}$CMAKE_PREFIX_PATH"
+if [ $IS_DARWIN -eq 0 ]; then
+  export LD_LIBRARY_PATH="{2}$LD_LIBRARY_PATH"
+else
+  export DYLD_LIBRARY_PATH="{2}$DYLD_LIBRARY_PATH"
+fi
+export PATH="{3}:$PATH"
+export PKG_CONFIG_PATH="{4}$PKG_CONFIG_PATH"
+export PYTHONPATH="{5}$PYTHONPATH"
+
+exec "$@"
+""".format(last_env, cmake_prefix_path, ld_path, path, pkgcfg_path, pythonpath)
+        )
+    os.chmod(new_env_path, stat.S_IXUSR | stat.S_IWUSR | stat.S_IRUSR)
 
 
 def build_package(
@@ -346,13 +403,29 @@ def build_package(
                     'catkin_generated',
                     'env_cached.sh'
                 )
+            if not os.path.exists(new_last_env):
+                raise RuntimeError(
+                    "No env_cached.sh file generated at: " + new_last_env +
+                    "\n  This sometimes occurs when a non-catkin package is "
+                    "interpretted as a catkin package."
+                )
         elif build_type_tag == 'cmake':
             build_cmake_package(
                 path, package,
                 workspace, buildspace, develspace, installspace,
                 install, jobs, force_cmake, quiet, last_env
             )
-            new_last_env = last_env
+            if install:
+                new_last_env = os.path.join(
+                    installspace,
+                    'env_cached.sh'
+                )
+            else:
+                new_last_env = os.path.join(
+                    buildspace,
+                    package.name,
+                    'env_cached.sh'
+                )
         else:
             sys.exit('Can not build package with unknown build_type')
     if number is not None and of is not None:
@@ -511,6 +584,14 @@ def build_workspace_isolated(
                 '@{rf}@!<==@| ' +
                 'Failed to process package \'@!@{bf}' +
                 package.name + '@|\': \n  ' +
+                str(e)
+            )
+            sys.exit('Command failed, exiting.')
+        except Exception as e:
+            cprint(
+                '@{rf}@!<==@| ' +
+                'Failed to process package \'@!@{bf}' +
+                package.name + '@|\': \n  ' + str(type(e)) + ": " +
                 str(e)
             )
             sys.exit('Command failed, exiting.')
